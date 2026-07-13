@@ -12,6 +12,7 @@ import re
 from chains import (
     DEFAULT_CHAIN_CONFIG, get_ca_pattern, get_evm_link_patterns,
     build_notification_links, normalize_address, resolve_target_chat,
+    chain_state_filename, migrate_legacy_state_file,
 )
 
 class TokenTracker:
@@ -28,23 +29,9 @@ class TokenTracker:
         # Chat to monitor for buy/sell messages - Solana/EVM each have their own bot
         self.target_chat = target_chat or resolve_target_chat(self.chain_config.get('chain_type', 'solana'))
 
-        # Initialize tracked_tokens.json and sold_tokens.json
-        self.tokens_file = Path('tracked_tokens.json')
-        self.sold_tokens_file = Path('sold_tokens.json')
-        
-        if not self.tokens_file.exists():
-            print("✨ Creating tracked tokens file...")
-            self.save_tracked_tokens()
-            print("✓ tracked_tokens.json created")
-            
-        if not self.sold_tokens_file.exists():
-            print("✨ Creating sold tokens file...")
-            self.save_sold_tokens()
-            print("✓ sold_tokens.json created")
-        
-        self.load_tracked_tokens()
-        self.load_sold_tokens()
-        
+        # Initialize this chain's tracked_tokens.json/sold_tokens.json
+        self._load_chain_state_files()
+
         # Rate limiting (tuned per-chain: Jupiter allows 600/min, DexScreener's
         # public tier is far stingier)
         self.MIN_CHECK_INTERVAL = 60  # Minimum time between checks for each token
@@ -85,11 +72,39 @@ class TokenTracker:
             self.RATE_LIMIT_WINDOW = 60
 
     def apply_chain_config(self, chain_config: dict, target_chat: Optional[str] = None):
-        """Update chain config (and its associated target chat) at runtime
-        (e.g. via main.py's 'Change Blockchain' menu)."""
+        """Update chain config (and its associated target chat + per-chain
+        tracked/sold-token files) at runtime (e.g. via main.py's 'Change
+        Blockchain' menu). Each chain keeps its own tracked/sold-token
+        history, so switching reloads (not clears) the new chain's state."""
         self.chain_config = chain_config
         self.target_chat = target_chat or resolve_target_chat(chain_config.get('chain_type', 'solana'))
         self._apply_rate_limit_for_chain()
+        self._load_chain_state_files()
+
+    def _load_chain_state_files(self):
+        """(Re)point tracked/sold-token files at the active chain and load
+        them, migrating from the pre-multi-chain shared files the first time
+        (Solana only, since that data predates EVM support)."""
+        chain_type = self.chain_config.get('chain_type', 'solana')
+        self.tokens_file = Path(chain_state_filename('tracked_tokens', chain_type))
+        self.sold_tokens_file = Path(chain_state_filename('sold_tokens', chain_type))
+        migrate_legacy_state_file(Path('tracked_tokens.json'), self.tokens_file, chain_type)
+        migrate_legacy_state_file(Path('sold_tokens.json'), self.sold_tokens_file, chain_type)
+
+        if not self.tokens_file.exists():
+            print("✨ Creating tracked tokens file...")
+            self.tracked_tokens = {}
+            self.save_tracked_tokens()
+            print(f"✓ {self.tokens_file.name} created")
+
+        if not self.sold_tokens_file.exists():
+            print("✨ Creating sold tokens file...")
+            self.sold_tokens = set()
+            self.save_sold_tokens()
+            print(f"✓ {self.sold_tokens_file.name} created")
+
+        self.load_tracked_tokens()
+        self.load_sold_tokens()
 
     async def initialize(self):
         """Run initial cleanup after client is connected"""

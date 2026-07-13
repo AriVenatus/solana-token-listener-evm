@@ -102,12 +102,9 @@ When the bot is running, you can use these commands:
 
 ### 1. Source Chat Monitoring
 - The bot watches messages in your chosen source chats
-- It looks for Solana contract addresses in various formats:
-  - Raw addresses
-  - DexScreener links
-  - Birdeye links
-  - Jupiter links
-  - And more!
+- What it looks for depends on the active chain (see "Supported Chains" above):
+  - **Solana**: base58 addresses, DexScreener/Birdeye/Solscan/Jupiter/pump.fun/gmgn links
+  - **EVM chains**: `0x...` addresses, DexScreener links, and your configured chain's block explorer links
 
 ### 2. User Filtering
 - For each source chat, you can choose specific users to monitor
@@ -115,13 +112,16 @@ When the bot is running, you can use these commands:
 - Other users' messages will be ignored
 
 ### 3. Token Forwarding
-- When a valid contract address is found, it's forwarded to your target chat
+- When a valid contract address is found, it's forwarded to the bot for the
+  active chain — `TARGET_CHAT_SOLANA` for Solana, `TARGET_CHAT_EVM` for any
+  EVM chain
 - Each token is only forwarded once to avoid duplicates
 - The bot maintains a list of processed tokens
 
 ### 4. Market Cap Tracking
 - The bot tracks market cap for forwarded tokens
-- It checks prices using Jupiter API (with GeckoTerminal as backup)
+- Solana: Jupiter API, with GeckoTerminal as backup
+- EVM chains: DexScreener, with GeckoTerminal as an optional backup where supported
 - You'll get notifications when tokens hit significant multiples (2x, 3x, etc.)
 
 ### 5. Detailed Feed
@@ -162,7 +162,8 @@ When the bot is running, you can use these commands:
 2. **Messages not forwarding:**
    - Confirm source chat configuration
    - Check user filters
-   - Verify target chat settings
+   - Verify `TARGET_CHAT_SOLANA`/`TARGET_CHAT_EVM` in `.env` — make sure the
+     one matching your active chain (check "View Current Settings") is set correctly
 
 3. **Market cap not updating:**
    - Check your internet connection
@@ -183,9 +184,10 @@ When the bot is running, you can use these commands:
 ## 📝 Files You Should Know About
 
 - `.env` - Your private configuration
-- `sol_listener_config.json` - Bot settings and filters
-- `processed_tokens.json` - List of processed tokens
-- `tracked_tokens.json` - Current token tracking data
+- `sol_listener_config.json` - Bot settings, filters, and active chain
+- `processed_tokens_solana.json` / `processed_tokens_evm.json` - List of processed tokens, one file per chain
+- `tracked_tokens_solana.json` / `tracked_tokens_evm.json` - Current token tracking data, one file per chain
+- `sold_tokens_solana.json` / `sold_tokens_evm.json` - Sold-token history, one file per chain
 
 ## 🔄 Updating the Bot
 

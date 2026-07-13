@@ -1,6 +1,8 @@
 """Shared blockchain/chain-config definitions and helpers used by main.py and token_tracker.py."""
 import os
 import re
+import shutil
+from pathlib import Path
 
 SOLANA_CA_PATTERN = r'[1-9A-HJ-NP-Za-km-z]{32,44}'   # base58, no 0/O/I/l
 EVM_CA_PATTERN = r'0x[a-fA-F0-9]{40}'
@@ -52,6 +54,30 @@ DEFAULT_CHAIN_CONFIG = {
 def get_ca_pattern(chain_type: str) -> str:
     """The single 'which address alphabet applies' switch used everywhere."""
     return EVM_CA_PATTERN if chain_type == 'evm' else SOLANA_CA_PATTERN
+
+
+def chain_state_filename(base_name: str, chain_type: str) -> str:
+    """Per-chain filename for a persisted-state file, e.g.
+    chain_state_filename('processed_tokens', 'evm') -> 'processed_tokens_evm.json'.
+    Solana and EVM each keep their own processed/tracked/sold-token history,
+    since they're two independent forwarding pipelines."""
+    suffix = 'evm' if chain_type == 'evm' else 'solana'
+    return f"{base_name}_{suffix}.json"
+
+
+def migrate_legacy_state_file(legacy_path, new_path, chain_type: str) -> None:
+    """Seed a newly-introduced per-chain state file from the old pre-multi-chain
+    shared file, the first time it's needed. Only applies to Solana - all data
+    in the legacy file predates EVM support, so it's safe to treat as Solana
+    history. No-op if the new file already exists or there's nothing to migrate."""
+    legacy_path = Path(legacy_path)
+    new_path = Path(new_path)
+    if chain_type != 'solana' or new_path.exists() or not legacy_path.exists():
+        return
+    try:
+        shutil.copy(legacy_path, new_path)
+    except Exception:
+        pass
 
 
 def target_chat_env_var(chain_type: str) -> str:

@@ -27,7 +27,8 @@ from datetime import datetime
 from chains import (
     EVM_CHAINS, DEFAULT_CHAIN_CONFIG, get_ca_pattern, get_evm_link_patterns,
     normalize_address, describe_chain_config, prompt_chain_selection,
-    resolve_target_chat, target_chat_env_var,
+    resolve_target_chat, target_chat_env_var, chain_state_filename,
+    migrate_legacy_state_file,
 )
 
 __version__ = "1.0.0"
@@ -164,6 +165,14 @@ class SimpleSolListener:
         self.source_chats = []
         self.filtered_users = {}
         self.processed_tokens = set()
+
+        # Each chain keeps its own processed-tokens history
+        self.processed_tokens_file = BASE_DIR / chain_state_filename(
+            'processed_tokens', self.chain_config.get('chain_type', 'solana'))
+        migrate_legacy_state_file(
+            BASE_DIR / 'processed_tokens.json', self.processed_tokens_file,
+            self.chain_config.get('chain_type', 'solana'))
+
         self.forwarded_count = 0
         self.show_detailed_feed = False
         self.dialogs_cache = {}
@@ -230,15 +239,15 @@ class SimpleSolListener:
         else:
             print("✓ sol_listener_config.json (existing)")
             
-        # Processed tokens file
-        tokens_file = BASE_DIR / 'processed_tokens.json'
+        # Processed tokens file (per-chain)
+        tokens_file = self.processed_tokens_file
         if not os.path.exists(tokens_file):
             print("✨ Creating processed tokens file...")
             with open(tokens_file, 'w') as f:
                 json.dump([], f)
-            print("✓ processed_tokens.json")
+            print(f"✓ {tokens_file.name}")
         else:
-            print("✓ processed_tokens.json (existing)")
+            print(f"✓ {tokens_file.name} (existing)")
             
         # Environment file check
         if not os.path.exists(ENV_FILE):
@@ -1133,13 +1142,12 @@ DEBUG=false
         return dialogs
 
     def load_processed_tokens(self):
-        """Load processed tokens from JSON file"""
-        tokens_file = BASE_DIR / 'processed_tokens.json'
-        if tokens_file.exists():
+        """Load processed tokens from this chain's JSON file"""
+        if self.processed_tokens_file.exists():
             try:
-                with open(tokens_file, 'r') as f:
+                with open(self.processed_tokens_file, 'r') as f:
                     self.processed_tokens = set(json.load(f))
-                logging.info(f"Loaded {len(self.processed_tokens)} processed tokens")
+                logging.info(f"Loaded {len(self.processed_tokens)} processed tokens from {self.processed_tokens_file.name}")
             except Exception as e:
                 logging.error(f"Error loading processed tokens: {str(e)}")
                 self.processed_tokens = set()
@@ -1147,12 +1155,11 @@ DEBUG=false
             self.processed_tokens = set()
 
     def save_processed_tokens(self):
-        """Save processed tokens to JSON file"""
+        """Save processed tokens to this chain's JSON file"""
         try:
-            tokens_file = BASE_DIR / 'processed_tokens.json'
-            with open(tokens_file, 'w') as f:
+            with open(self.processed_tokens_file, 'w') as f:
                 json.dump(list(self.processed_tokens), f, indent=4)
-            logging.info(f"Saved {len(self.processed_tokens)} processed tokens")
+            logging.info(f"Saved {len(self.processed_tokens)} processed tokens to {self.processed_tokens_file.name}")
         except Exception as e:
             logging.error(f"Error saving processed tokens: {str(e)}")
 
@@ -1446,17 +1453,17 @@ DEBUG=false
         self.save_config()
         self.token_tracker.apply_chain_config(new_chain_config, target_chat=new_target_chat)
 
+        # Each chain keeps its own processed-tokens history, so switching
+        # just points at (and loads) that chain's own file - nothing to clear.
+        chain_type = new_chain_config['chain_type']
+        self.processed_tokens_file = BASE_DIR / chain_state_filename('processed_tokens', chain_type)
+        migrate_legacy_state_file(BASE_DIR / 'processed_tokens.json', self.processed_tokens_file, chain_type)
+        self.load_processed_tokens()
+
         print(f"\n✅ Blockchain set to: {describe_chain_config(new_chain_config)}")
         print(f"📬 Now forwarding to: {self.target_chat}")
-        print("⚠️  tracked_tokens.json/sold_tokens.json currently hold addresses for the previous chain.")
-        if input("Clear them now? (y/n): ").strip().lower() == 'y':
-            self.token_tracker.tracked_tokens = {}
-            self.token_tracker.sold_tokens = set()
-            self.token_tracker.save_tracked_tokens()
-            self.token_tracker.save_sold_tokens()
-            print("✅ Cleared tracked_tokens.json and sold_tokens.json")
-        else:
-            print("ℹ️  Leaving old entries in place - they'll just fail mcap lookups until removed manually (Option 6).")
+        print(f"📄 Using {self.processed_tokens_file.name} / {self.token_tracker.tokens_file.name} / "
+              f"{self.token_tracker.sold_tokens_file.name} for this chain's history")
 
         input("\nPress Enter to continue...")
 

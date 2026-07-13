@@ -2,8 +2,8 @@
 config.env
 !config.env.sample
 sol_listener_config.json
-processed_tokens.json
-sold_tokens.json
+processed_tokens*.json
+sold_tokens*.json
 temp_images/
 logs/
 *.session
@@ -103,6 +103,6 @@ coverage.xml
 cover/
 
 # Project specific
-tracked_tokens.json
+tracked_tokens*.json
 solana_listener.session
 channel_analyzer.py
