@@ -24,6 +24,11 @@ from dotenv import load_dotenv
 import sys
 from token_tracker import TokenTracker
 from datetime import datetime
+from chains import (
+    EVM_CHAINS, DEFAULT_CHAIN_CONFIG, get_ca_pattern, get_evm_link_patterns,
+    normalize_address, describe_chain_config, prompt_chain_selection,
+    resolve_target_chat, target_chat_env_var,
+)
 
 __version__ = "1.0.0"
 
@@ -61,6 +66,17 @@ PRIMARY_BOT = {
     'ref': 'r-forza222'
 }
 
+# Skeleton for a freshly created sol_listener_config.json
+DEFAULT_CONFIG = {
+    'source_chats': [],
+    'filtered_users': {},
+    'session_string': None,
+    'verified': False,
+    'blacklisted_keywords': [],
+    'whitelisted_keywords': [],
+    'chain_config': DEFAULT_CHAIN_CONFIG,
+}
+
 # Load environment variables
 load_dotenv(ENV_FILE)
 try:
@@ -73,12 +89,18 @@ try:
     if not API_HASH:
         raise ValueError("API_HASH environment variable is not set in .env file")
         
-    TARGET_CHAT = os.getenv('TARGET_CHAT')
-    if not TARGET_CHAT:
-        raise ValueError("TARGET_CHAT environment variable is not set in .env file")
-    # Clean up target chat value
-    TARGET_CHAT = TARGET_CHAT.lstrip('@').strip()  # Remove @ prefix and whitespace
-    
+    # Two separate forwarding targets: one bot/chat per chain, since Solana
+    # and EVM tokens get forwarded to different trading bots.
+    TARGET_CHAT_SOLANA = os.getenv('TARGET_CHAT_SOLANA')
+    if not TARGET_CHAT_SOLANA:
+        raise ValueError("TARGET_CHAT_SOLANA environment variable is not set in .env file")
+    TARGET_CHAT_SOLANA = TARGET_CHAT_SOLANA.lstrip('@').strip()
+
+    TARGET_CHAT_EVM = os.getenv('TARGET_CHAT_EVM')
+    if not TARGET_CHAT_EVM:
+        raise ValueError("TARGET_CHAT_EVM environment variable is not set in .env file")
+    TARGET_CHAT_EVM = TARGET_CHAT_EVM.lstrip('@').strip()
+
     # Get tracking chat for notifications
     TRACKING_CHAT = os.getenv('TRACKING_CHAT', 'me')  # Default to 'me' if not set
     TRACKING_CHAT = TRACKING_CHAT.lstrip('@').strip()  # Clean up tracking chat value
@@ -88,21 +110,56 @@ except (ValueError, TypeError) as e:
     print("2. Your .env file should contain:")
     print("   API_ID=your_api_id_here")
     print("   API_HASH=your_api_hash_here")
-    print("   TARGET_CHAT=target_chat_here")
+    print("   TARGET_CHAT_SOLANA=your_solana_trading_bot_here")
+    print("   TARGET_CHAT_EVM=your_evm_trading_bot_here")
     print("   TRACKING_CHAT=tracking_chat_here (optional, defaults to 'me')")
     print("\n3. API_ID should be a number")
     print("4. Get API_ID and API_HASH from https://my.telegram.org")
     print(f"\nSpecific error: {str(e)}")
     sys.exit(1)
 
+def load_or_select_chain_config() -> dict:
+    """Load the persisted chain_config, or prompt for one on first run.
+    Runs before any TelegramClient/TokenTracker exists (pure file + stdin I/O)."""
+    config = {}
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, 'r') as f:
+                config = json.load(f)
+        except Exception as e:
+            logging.error(f"Error reading config for chain selection: {e}")
+
+    existing = config.get('chain_config')
+    if existing and existing.get('chain_type'):
+        # Re-resolve known presets live (picks up any future slug/explorer fixes);
+        # 'custom' entries and solana are used as persisted.
+        key = existing.get('evm_chain_key')
+        if existing.get('chain_type') == 'evm' and key and key != 'custom' and key in EVM_CHAINS:
+            existing = {'chain_type': 'evm', 'evm_chain_key': key, 'evm_chain': EVM_CHAINS[key]}
+        return existing
+
+    print("\n🔗 First-time setup: choose a blockchain to monitor")
+    chain_config = prompt_chain_selection()
+    config['chain_config'] = chain_config
+    for key, value in DEFAULT_CONFIG.items():
+        config.setdefault(key, value)
+    try:
+        with open(CONFIG_FILE, 'w') as f:
+            json.dump(config, f, indent=4)
+    except Exception as e:
+        logging.error(f"Error persisting chain config: {e}")
+    return chain_config
+
+
 class SimpleSolListener:
     """Telegram bot for monitoring and forwarding Solana contract addresses"""
     
-    def __init__(self, client):
+    def __init__(self, client, chain_config: dict = None, token_tracker: TokenTracker = None, target_chat: str = None):
         """Initialize the SimpleSolListener"""
         load_dotenv()
-        
+
         self.client = client  # NEW: store the passed-in client
+        self.chain_config = chain_config or DEFAULT_CHAIN_CONFIG.copy()
         self.config = {}
         self.source_chats = []
         self.filtered_users = {}
@@ -110,20 +167,25 @@ class SimpleSolListener:
         self.forwarded_count = 0
         self.show_detailed_feed = False
         self.dialogs_cache = {}
-        
+
         # Track startup time and how many messages we've processed
         self.start_time = time.time()     # NEW
         self.processed_count = 0          # NEW
 
-        # Get target chat from environment
-        self.target_chat = os.getenv('TARGET_CHAT')
+        # Resolve the forwarding target for the active chain (Solana / EVM
+        # each forward to their own bot/chat)
+        self.target_chat = target_chat or resolve_target_chat(self.chain_config.get('chain_type', 'solana'))
         if not self.target_chat:
-            logging.error("TARGET_CHAT not set in environment variables")
-            raise ValueError("TARGET_CHAT environment variable is required")
-            
-        # Initialize token tracker
-        tracking_chat = os.getenv('TRACKING_CHAT', 'me')
-        self.token_tracker = TokenTracker(self.client, tracking_chat)
+            env_var = target_chat_env_var(self.chain_config.get('chain_type', 'solana'))
+            logging.error(f"{env_var} not set in environment variables")
+            raise ValueError(f"{env_var} environment variable is required")
+
+        # Initialize token tracker - reuse the shared instance from main() if provided
+        if token_tracker is not None:
+            self.token_tracker = token_tracker
+        else:
+            tracking_chat = os.getenv('TRACKING_CHAT', 'me')
+            self.token_tracker = TokenTracker(self.client, tracking_chat, chain_config=self.chain_config, target_chat=self.target_chat)
         
         # Create required files
         self._initialize_config_files()
@@ -139,10 +201,11 @@ class SimpleSolListener:
         
     def _check_environment(self) -> bool:
         """Check if all required environment variables are set"""
+        env_var = target_chat_env_var(self.chain_config.get('chain_type', 'solana'))
         required_vars = {
             'API_ID': API_ID,
             'API_HASH': API_HASH,
-            'TARGET_CHAT': TARGET_CHAT
+            env_var: os.getenv(env_var)
         }
         
         all_present = True
@@ -160,13 +223,7 @@ class SimpleSolListener:
         # Config file
         if not os.path.exists(CONFIG_FILE):
             print("✨ Creating new configuration file...")
-            initial_config = {
-                'source_chats': [],
-                'filtered_users': {},
-                'session_string': None,
-                'verified': False,
-                'blacklisted_keywords': []
-            }
+            initial_config = DEFAULT_CONFIG.copy()
             with open(CONFIG_FILE, 'w') as f:
                 json.dump(initial_config, f, indent=4)
             print("✓ sol_listener_config.json")
@@ -190,7 +247,8 @@ class SimpleSolListener:
             with open(ENV_FILE, 'w') as f:
                 f.write("""API_ID=
 API_HASH=
-TARGET_CHAT=
+TARGET_CHAT_SOLANA=
+TARGET_CHAT_EVM=
 TRACKING_CHAT=me
 DEBUG=false
 """)
@@ -235,7 +293,8 @@ DEBUG=false
         return {
             'source_chats': [],
             'filtered_users': {},
-            'session_string': None
+            'session_string': None,
+            'chain_config': self.chain_config
         }
 
     def save_config(self):
@@ -245,6 +304,7 @@ DEBUG=false
                 self.config['session_string'] = self.client.session.save()
             self.config['source_chats'] = self.source_chats
             self.config['filtered_users'] = self.filtered_users
+            self.config['chain_config'] = self.chain_config
             with open(CONFIG_FILE, 'w') as f:
                 json.dump(self.config, f, indent=4)
             logging.info("Configuration saved successfully")
@@ -253,33 +313,37 @@ DEBUG=false
             logging.error(f"Error saving config: {str(e)}")
 
     async def extract_ca_from_text(self, text: str) -> str:
-        """Extract Solana CA from text with improved validation"""
+        """Extract a contract address (Solana or EVM, per configured chain) from text"""
         if not text:
             return None
 
         logging.info(f"Checking text for CA: {text[:200]}...")  # Limit log length
 
-        # Updated regex patterns for better matching
-        link_patterns = [
-            r'(?:dexscreener\.com/solana|birdeye\.so/token|solscan\.io/token|jup\.ag/swap/[^-]+-|pump\.fun/coin|gmgn\.ai/sol/token)/([1-9A-HJ-NP-Za-km-z]{32,44})',
-            r'\b([1-9A-HJ-NP-Za-km-z]{32,44})\b'  # Raw CA as fallback
-        ]
+        chain_type = self.chain_config.get('chain_type', 'solana')
+        addr_pattern = get_ca_pattern(chain_type)
 
+        if chain_type == 'evm':
+            link_patterns = get_evm_link_patterns(self.chain_config.get('evm_chain')) + [rf'\b({addr_pattern})\b']
+        else:
+            link_patterns = [
+                r'(?:dexscreener\.com/solana|birdeye\.so/token|solscan\.io/token|jup\.ag/swap/[^-]+-|pump\.fun/coin|gmgn\.ai/sol/token)/(' + addr_pattern + ')',
+                rf'\b({addr_pattern})\b'  # Raw CA as fallback
+            ]
+
+        flags = re.IGNORECASE if chain_type == 'evm' else 0
         found_ca = None
         for pattern in link_patterns:
-            matches = re.finditer(pattern, text)
+            matches = re.finditer(pattern, text, flags)
             for match in matches:
                 ca = match.group(1)
-                
-                # Basic CA validation
-                if not ca or len(ca) < 32 or len(ca) > 44:
-                    continue
-                    
-                # Check for invalid characters
-                if not re.match(r'^[1-9A-HJ-NP-Za-km-z]+$', ca):
+
+                if not ca or not re.match(rf'^{addr_pattern}$', ca, flags):
                     continue
 
-                if found_ca and found_ca.lower() != ca.lower():
+                if chain_type == 'solana' and (len(ca) < 32 or len(ca) > 44):
+                    continue
+
+                if found_ca and normalize_address(found_ca, chain_type) != normalize_address(ca, chain_type):
                     logging.warning(f"Multiple distinct CAs found: {found_ca} vs {ca}")
                     continue
 
@@ -290,7 +354,7 @@ DEBUG=false
             if found_ca:
                 break
 
-        return found_ca
+        return normalize_address(found_ca, chain_type) if found_ca else None
 
     async def process_message_content(self, message) -> tuple[str, str]:
         """Process different types of message content"""
@@ -470,7 +534,7 @@ DEBUG=false
                     chat_info = f"{len(self.source_chats)} chats configured"
                     logging.error(f"Error getting chat names: {e}")
             
-            print("\n🔧 Main Menu")
+            print(f"\n🔧 Main Menu  [{describe_chain_config(self.chain_config)}]")
             print("=" * 50)
             print(f"0. Quick Start - Resume Monitoring ({chat_info})")
             print("1. Start Monitoring")
@@ -479,8 +543,9 @@ DEBUG=false
             print("4. Manage Keyword Filters")
             print("5. View Tracked Tokens")
             print("6. Manage Tracked Tokens")  # New option
-            print("7. Exit\n")
-            choice = input("Enter your choice (0-7): ").strip()
+            print("7. Change Blockchain")
+            print("8. Exit\n")
+            choice = input("Enter your choice (0-8): ").strip()
             
             try:
                 if choice == "0":
@@ -520,6 +585,8 @@ DEBUG=false
                 elif choice == "6":
                     await self.manage_tracked_tokens()
                 elif choice == "7":
+                    await self.change_blockchain()
+                elif choice == "8":
                     print("\n👋 Goodbye!")
                     await self.client.disconnect()
                     return False
@@ -567,8 +634,8 @@ DEBUG=false
             
         print("\n🚀 Starting monitoring...")
         print(f"✨ Monitoring {len(self.source_chats)} chats for new tokens")
-        print(f"📬 Forwarding to: {TARGET_CHAT}")
-        print(f"📊 Tracking market caps in: {TARGET_CHAT}")
+        print(f"📬 Forwarding to: {self.target_chat}")
+        print(f"📊 Tracking market caps in: {self.target_chat}")
         print("\n📋 Available Commands:")
         print("--------------------------------------------------")
         print("• feed   - Toggle detailed message feed ON/OFF")
@@ -601,8 +668,8 @@ DEBUG=false
                 if event_chat_id in [abs(x) for x in self.source_chats]:
                     await self.handle_source_message(event)
                 # If it's the target chat
-                elif (str(event_chat_id) == str(TARGET_CHAT) if str(TARGET_CHAT).isdigit() 
-                      else event.chat.username == TARGET_CHAT.lstrip('@')):
+                elif (str(event_chat_id) == str(self.target_chat) if str(self.target_chat).isdigit()
+                      else event.chat.username == self.target_chat.lstrip('@')):
                     await self.handle_target_message(event)
                     
             except Exception as e:
@@ -857,7 +924,8 @@ DEBUG=false
         """View current settings"""
         print("\n📊 Current Configuration")
         print("=" * 50)
-        
+        print(f"\nBlockchain: {describe_chain_config(self.chain_config)}")
+
         if self.source_chats:
             print(f"\nMonitored Chats: {len(self.source_chats)}")
             for chat_id in self.source_chats:
@@ -874,7 +942,7 @@ DEBUG=false
         else:
             print("\nNo channels configured")
             
-        print(f"\nTarget Chat: {TARGET_CHAT}")
+        print(f"\nTarget Chat ({describe_chain_config(self.chain_config)}): {self.target_chat}")
         input("\nPress Enter to continue...")
 
     async def manage_keyword_filters(self):
@@ -1019,21 +1087,23 @@ DEBUG=false
     async def forward_message(self, ca: str):
         """Forward contract address to target chat"""
         if not self.target_chat:
-            error_msg = "TARGET_CHAT not configured"
+            env_var = target_chat_env_var(self.chain_config.get('chain_type', 'solana'))
+            error_msg = f"{env_var} not configured"
             logging.error(error_msg)
             raise ValueError(error_msg)
-            
+
         if not self.client:
             error_msg = "Telegram client not initialized"
             logging.error(error_msg)
             raise ValueError(error_msg)
-            
+
         try:
             # Get target entity
             try:
                 target_entity = await self.client.get_entity(self.target_chat)
             except ValueError as e:
-                error_msg = f"Invalid TARGET_CHAT value: {self.target_chat}. Error: {str(e)}"
+                env_var = target_chat_env_var(self.chain_config.get('chain_type', 'solana'))
+                error_msg = f"Invalid {env_var} value: {self.target_chat}. Error: {str(e)}"
                 logging.error(error_msg)
                 raise ValueError(error_msg)
                 
@@ -1349,34 +1419,85 @@ DEBUG=false
         
         input("\nPress Enter to continue...")
 
+    async def change_blockchain(self):
+        """Let the user re-pick the monitored blockchain; persists and propagates
+        the change to the shared TokenTracker instance."""
+        print("\n🔗 Blockchain Configuration")
+        print("=" * 50)
+        print(f"Current: {describe_chain_config(self.chain_config)}")
+
+        new_chain_config = prompt_chain_selection()
+        if new_chain_config == self.chain_config:
+            print("\nNo change made.")
+            input("\nPress Enter to continue...")
+            return
+
+        new_target_chat = resolve_target_chat(new_chain_config['chain_type'])
+        if not new_target_chat:
+            env_var = target_chat_env_var(new_chain_config['chain_type'])
+            print(f"\n❌ {env_var} is not set in your .env file.")
+            print(f"Add {env_var}=<your_trading_bot_chat> and restart before switching to this chain.")
+            input("\nPress Enter to continue...")
+            return
+
+        self.chain_config = new_chain_config
+        self.target_chat = new_target_chat
+        self.config['chain_config'] = new_chain_config
+        self.save_config()
+        self.token_tracker.apply_chain_config(new_chain_config, target_chat=new_target_chat)
+
+        print(f"\n✅ Blockchain set to: {describe_chain_config(new_chain_config)}")
+        print(f"📬 Now forwarding to: {self.target_chat}")
+        print("⚠️  tracked_tokens.json/sold_tokens.json currently hold addresses for the previous chain.")
+        if input("Clear them now? (y/n): ").strip().lower() == 'y':
+            self.token_tracker.tracked_tokens = {}
+            self.token_tracker.sold_tokens = set()
+            self.token_tracker.save_tracked_tokens()
+            self.token_tracker.save_sold_tokens()
+            print("✅ Cleared tracked_tokens.json and sold_tokens.json")
+        else:
+            print("ℹ️  Leaving old entries in place - they'll just fail mcap lookups until removed manually (Option 6).")
+
+        input("\nPress Enter to continue...")
+
 async def main():
     """Main function to run the Telegram bot"""
     try:
         print("\n🚀 Starting Telegram Bot")
         print("==================================================")
-        
+
+        # Chain must be known before TokenTracker is constructed, since
+        # initial_cleanup() immediately parses the target chat's history
+        # using chain-specific CA regex.
+        chain_config = load_or_select_chain_config()
+        print(f"⛓️  Monitoring chain: {describe_chain_config(chain_config)}")
+
+        # Solana and EVM each forward to their own bot/chat
+        target_chat = resolve_target_chat(chain_config['chain_type'])
+        print(f"📬 Forwarding target: {target_chat}")
+
         # Initialize the client
         client = TelegramClient('anon', API_ID, API_HASH)
         await client.start()
-        
+
         print("✅ Connected to Telegram")
-        
-        # Initialize TokenTracker
+
+        # Initialize a single shared TokenTracker instance
         token_tracker = None
         if TRACKING_CHAT:
-            token_tracker = TokenTracker(client, notification_target=TRACKING_CHAT)
+            token_tracker = TokenTracker(client, notification_target=TRACKING_CHAT, chain_config=chain_config, target_chat=target_chat)
             print("✅ Token Tracker initialized")
-        
+
         # Run initial cleanup and catchup
         if token_tracker:
             await token_tracker.initial_cleanup()
-        
-        # Create SimpleSolListener instance
-        listener = SimpleSolListener(client=client)
-        
+
+        # Create SimpleSolListener instance, sharing the same token_tracker
+        listener = SimpleSolListener(client=client, chain_config=chain_config, token_tracker=token_tracker, target_chat=target_chat)
+
         # Show startup menu and handle user interaction
         await listener.start()
-        
+
     except Exception as e:
         logging.error(f"Error in main function: {str(e)}")
         logging.exception("Full traceback:")

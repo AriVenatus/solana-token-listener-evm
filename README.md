@@ -1,6 +1,6 @@
 # Solana Token Listener Bot 🚀
 
-A Telegram bot that helps you monitor Solana tokens from source chats and track their market performance.
+A Telegram bot that helps you monitor Solana and EVM tokens from source chats and track their market performance.
 
 ## 🌟 Features
 
@@ -9,6 +9,30 @@ A Telegram bot that helps you monitor Solana tokens from source chats and track 
 - Track market cap and price multiples
 - Detailed feed showing all monitored messages
 - User-friendly setup and configuration
+- Choose which blockchain to monitor — Solana or an EVM chain (Robinhood Chain and others)
+
+## ⛓️ Supported Chains
+
+The first time you run the bot, you'll be asked which blockchain to monitor.
+This choice is saved and can be changed later from the main menu
+("Change Blockchain"):
+
+- **Solana** (default, original behavior)
+- **Robinhood Chain** — Robinhood's EVM Layer 2 (chain ID 4663)
+- **Ethereum**
+- **Base**
+- **Arbitrum One**
+- **BNB Chain**
+- **Custom EVM chain** — enter your own name/chain ID/explorer/DexScreener slug
+
+Switching chains changes how contract addresses are recognized (Solana
+base58 vs. EVM `0x...` addresses), how market cap is looked up (Jupiter +
+Solana RPC for Solana; DexScreener for EVM chains), and **which bot found
+tokens are forwarded to** — Solana addresses always go to
+`TARGET_CHAT_SOLANA`, and EVM addresses (regardless of which EVM chain is
+selected) always go to `TARGET_CHAT_EVM`. When you switch chains, you'll be
+offered the option to clear your tracked-token history, since old entries
+won't resolve on the new chain.
 
 ## 📋 Prerequisites
 
@@ -41,9 +65,13 @@ pip install -r requirements.txt
 ```
 API_ID=your_api_id_here
 API_HASH=your_api_hash_here
-TARGET_CHAT=your_target_chat_here
+TARGET_CHAT_SOLANA=your_solana_trading_bot_here
+TARGET_CHAT_EVM=your_evm_trading_bot_here
 TRACKING_CHAT=your_tracking_chat_here
 ```
+You need both trading bots set up even if you only plan to use one chain
+right now — this lets you switch between Solana and EVM later (via
+"Change Blockchain") without editing `.env` again.
 
 ## 🚀 Running the Bot
 
@@ -102,6 +130,12 @@ When the bot is running, you can use these commands:
 - Track user activity and token discoveries
 
 ## ⚙️ Advanced Configuration
+
+### Changing the Monitored Blockchain
+1. From the main menu, choose **"Change Blockchain"**
+2. Pick Solana, a preset EVM chain (Robinhood Chain, Ethereum, Base,
+   Arbitrum One, BNB Chain), or enter a custom EVM chain
+3. Optionally clear existing tracked-token history when switching
 
 ### Managing User Filters
 1. Use the `add` command to select chats

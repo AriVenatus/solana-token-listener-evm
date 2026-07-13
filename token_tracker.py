@@ -9,9 +9,14 @@ import math
 import os
 from pathlib import Path
 import re
+from chains import (
+    DEFAULT_CHAIN_CONFIG, get_ca_pattern, get_evm_link_patterns,
+    build_notification_links, normalize_address, resolve_target_chat,
+)
 
 class TokenTracker:
-    def __init__(self, telegram_client, notification_target: str = 'me'):
+    def __init__(self, telegram_client, notification_target: str = 'me',
+                 chain_config: Optional[dict] = None, target_chat: Optional[str] = None):
         # Configure logging to be less verbose
         logging.getLogger().setLevel(logging.WARNING)  # Set default level to WARNING
         self.tracked_tokens = {}  # {token_address: {initial_mcap, name, symbol, last_notified_multiple}}
@@ -19,8 +24,10 @@ class TokenTracker:
         self.client = telegram_client
         self.JUPITER_BASE_URL = "https://api.jup.ag/price/v2"
         self.notification_target = notification_target  # Where to send notifications ('me' for Saved Messages)
-        self.target_chat = os.getenv('TARGET_CHAT')  # Chat to monitor for buy/sell messages
-        
+        self.chain_config = chain_config or DEFAULT_CHAIN_CONFIG.copy()
+        # Chat to monitor for buy/sell messages - Solana/EVM each have their own bot
+        self.target_chat = target_chat or resolve_target_chat(self.chain_config.get('chain_type', 'solana'))
+
         # Initialize tracked_tokens.json and sold_tokens.json
         self.tokens_file = Path('tracked_tokens.json')
         self.sold_tokens_file = Path('sold_tokens.json')
@@ -38,10 +45,10 @@ class TokenTracker:
         self.load_tracked_tokens()
         self.load_sold_tokens()
         
-        # Rate limiting for Jupiter API (600 requests per minute)
-        self.RATE_LIMIT_CALLS = 600
-        self.RATE_LIMIT_WINDOW = 60  # seconds
+        # Rate limiting (tuned per-chain: Jupiter allows 600/min, DexScreener's
+        # public tier is far stingier)
         self.MIN_CHECK_INTERVAL = 60  # Minimum time between checks for each token
+        self._apply_rate_limit_for_chain()
         self.api_call_times = []
         
         # Batch processing
@@ -67,6 +74,22 @@ class TokenTracker:
             "Price: $",                 # Price indicator
             "Renounced ✅"              # Renounced indicator
         ]
+
+    def _apply_rate_limit_for_chain(self):
+        """DexScreener's public tier is far stingier than Jupiter's 600/min."""
+        if self.chain_config.get('chain_type') == 'evm':
+            self.RATE_LIMIT_CALLS = 60
+            self.RATE_LIMIT_WINDOW = 60
+        else:
+            self.RATE_LIMIT_CALLS = 600
+            self.RATE_LIMIT_WINDOW = 60
+
+    def apply_chain_config(self, chain_config: dict, target_chat: Optional[str] = None):
+        """Update chain config (and its associated target chat) at runtime
+        (e.g. via main.py's 'Change Blockchain' menu)."""
+        self.chain_config = chain_config
+        self.target_chat = target_chat or resolve_target_chat(chain_config.get('chain_type', 'solana'))
+        self._apply_rate_limit_for_chain()
 
     async def initialize(self):
         """Run initial cleanup after client is connected"""
@@ -195,6 +218,12 @@ class TokenTracker:
         self.api_call_times.append(current_time)
 
     async def get_current_mcap(self, address: str) -> Optional[float]:
+        """Get current market cap, branching by configured chain"""
+        if self.chain_config.get('chain_type') == 'evm':
+            return await self._get_current_mcap_evm(address)
+        return await self._get_current_mcap_solana(address)
+
+    async def _get_current_mcap_solana(self, address: str) -> Optional[float]:
         """Get current market cap with retries and GeckoTerminal backup"""
         # Try Jupiter API first (with retries)
         for attempt in range(3):  # Try up to 3 times
@@ -271,6 +300,58 @@ class TokenTracker:
         
         # If both APIs fail, return None
         logging.error(f"❌ Could not get market cap for {address} from either Jupiter or GeckoTerminal")
+        return None
+
+    async def _get_current_mcap_evm(self, address: str) -> Optional[float]:
+        """Get current market cap for an EVM token via DexScreener (marketCap/fdv),
+        with GeckoTerminal as an optional best-effort backup for chains with a
+        known geckoterminal_network slug."""
+        evm_chain = self.chain_config.get('evm_chain') or {}
+        chain_slug = evm_chain.get('dexscreener_slug')
+
+        try:
+            await self.wait_for_rate_limit()
+            async with aiohttp.ClientSession() as session:
+                url = f"https://api.dexscreener.com/latest/dex/tokens/{address}"
+                async with session.get(url) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        pairs = (data or {}).get('pairs') or []
+                        matching = [p for p in pairs if chain_slug and p.get('chainId') == chain_slug]
+                        for pair in (matching or pairs):
+                            mcap = pair.get('marketCap') or pair.get('fdv')
+                            if mcap:
+                                mcap = float(mcap)
+                                logging.info(f"Got market cap from DexScreener for {address}: ${mcap:,.2f}")
+                                return mcap
+                    else:
+                        logging.error(f"❌ DexScreener API Error ({response.status}) for {address}")
+        except Exception as e:
+            logging.error(f"❌ DexScreener API error for {address}: {str(e)}")
+
+        gt_network = evm_chain.get('geckoterminal_network')
+        if gt_network:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    gecko_url = f"https://api.geckoterminal.com/api/v2/networks/{gt_network}/tokens/{address}"
+                    headers = {"Accept": "application/json"}
+                    async with session.get(gecko_url, headers=headers) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            attrs = (data or {}).get('data', {}).get('attributes', {})
+                            if attrs.get('fdv_usd') is not None:
+                                return float(attrs['fdv_usd'])
+                            if attrs.get('market_cap_usd') is not None:
+                                return float(attrs['market_cap_usd'])
+                        else:
+                            logging.error(f"❌ GeckoTerminal API Error ({response.status}) for {address}")
+            except Exception as e:
+                logging.error(f"❌ GeckoTerminal API error for {address}: {str(e)}")
+
+        logging.error(
+            f"❌ Could not get market cap for {address} via DexScreener"
+            f"{' or GeckoTerminal' if gt_network else ''}"
+        )
         return None
 
     def format_timestamp(self, timestamp: float) -> str:
@@ -362,9 +443,7 @@ class TokenTracker:
                     f"  • Change: +${current_mcap - info['initial_mcap']:,.2f}\n\n"
                     f"⏱ Time since entry: {int(hours)}h {int((hours % 1) * 60)}m\n\n"
                     f"Quick Links:\n"
-                    f"• Birdeye: https://birdeye.so/token/{address}\n"
-                    f"• DexScreener: https://dexscreener.com/solana/{address}\n"
-                    f"• Solscan: https://solscan.io/token/{address}"
+                    f"{build_notification_links(address, self.chain_config.get('chain_type', 'solana'), self.chain_config.get('evm_chain'))}"
                 )
                 await self.client.send_message(self.notification_target, message)
                 self.tracked_tokens[address]['last_notified_multiple'] = current_whole_multiple
@@ -699,26 +778,35 @@ class TokenTracker:
         """Extract contract address from message text"""
         if not text:
             return None
-        
+
+        chain_type = self.chain_config.get('chain_type', 'solana')
+        addr = get_ca_pattern(chain_type)
+
         # Common patterns in your messages
         patterns = [
             # Buy/Sell message format
-            r'(?:Buy|Sell)\s+\$[^\n]+\n([1-9A-HJ-NP-Za-km-z]{32,44})',
+            rf'(?:Buy|Sell)\s+\$[^\n]+\n({addr})',
             # Share token format
-            r'Share token with your Reflink\s*\n([1-9A-HJ-NP-Za-km-z]{32,44})',
+            rf'Share token with your Reflink\s*\n({addr})',
             # Direct contract address
-            r'^([1-9A-HJ-NP-Za-km-z]{32,44})$',
-            # Dexscreener link
-            r'dexscreener\.com/solana/([1-9A-HJ-NP-Za-km-z]{32,44})',
-            # Other common links
-            r'(?:birdeye\.so/token|solscan\.io/token|jup\.ag/swap/[^-]+-)([1-9A-HJ-NP-Za-km-z]{32,44})'
+            rf'^({addr})$',
         ]
-        
+        if chain_type == 'evm':
+            patterns += get_evm_link_patterns(self.chain_config.get('evm_chain'))
+        else:
+            patterns += [
+                # Dexscreener link
+                rf'dexscreener\.com/solana/({addr})',
+                # Other common links
+                rf'(?:birdeye\.so/token|solscan\.io/token|jup\.ag/swap/[^-]+-)({addr})',
+            ]
+
+        flags = re.MULTILINE | (re.IGNORECASE if chain_type == 'evm' else 0)
         for pattern in patterns:
-            match = re.search(pattern, text, re.MULTILINE)
+            match = re.search(pattern, text, flags)
             if match:
-                return match.group(1)
-        
+                return normalize_address(match.group(1), chain_type)
+
         return None
 
     async def handle_sell_message(self, message: str, ca: str):
